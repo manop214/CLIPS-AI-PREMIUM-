@@ -1,5 +1,5 @@
+
 import os
-import json
 import uuid
 import subprocess
 import threading
@@ -16,7 +16,6 @@ from flask_wtf.csrf import CSRFProtect
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
-from openai import OpenAI
 
 load_dotenv()
 
@@ -36,7 +35,9 @@ app.config.update(
     MAX_CONTENT_LENGTH=2 * 1024 * 1024 * 1024,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "true").lower() == "true",
+    SESSION_COOKIE_SECURE=os.environ.get(
+        "COOKIE_SECURE", "true"
+    ).lower() == "true",
 )
 
 db = SQLAlchemy(app)
@@ -44,13 +45,10 @@ csrf = CSRFProtect(app)
 
 ALLOWED = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 
-# Evita varios procesamientos simultáneos.
 processing_lock = threading.Lock()
+whisper_model = None
+model_lock = threading.Lock()
 
-
-# =========================
-# MODELOS DE BASE DE DATOS
-# =========================
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -69,7 +67,9 @@ class Video(db.Model):
 
 class Clip(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    video_id = db.Column(db.Integer, db.ForeignKey("video.id"), nullable=False)
+    video_id = db.Column(
+        db.Integer, db.ForeignKey("video.id"), nullable=False
+    )
     filename = db.Column(db.String(255), nullable=False)
     title = db.Column(db.String(180), nullable=False)
     reason = db.Column(db.Text)
@@ -79,10 +79,6 @@ class Clip(db.Model):
 
     video = db.relationship("Video", backref="clips")
 
-
-# =========================
-# AUTENTICACIÓN
-# =========================
 
 def login_required(fn):
     @wraps(fn)
@@ -136,10 +132,6 @@ def logout():
     return redirect(url_for("login"))
 
 
-# =========================
-# PANEL PRINCIPAL
-# =========================
-
 @app.get("/")
 @login_required
 def dashboard():
@@ -152,10 +144,6 @@ def dashboard():
         clips=clips
     )
 
-
-# =========================
-# SUBIR VÍDEO
-# =========================
 
 @app.post("/upload")
 @login_required
@@ -195,35 +183,18 @@ def upload():
     return redirect(url_for("dashboard"))
 
 
-# =========================
-# RECIBIR ENLACE
-# =========================
-
 @app.post("/add-video-link")
 @login_required
 def add_video_link():
-    video_url = request.form.get("video_url", "").strip()
-
-    if not video_url:
-        flash("Pega un enlace de vídeo válido.", "error")
-        return redirect(url_for("dashboard"))
-
-    if not video_url.startswith(("https://", "http://")):
-        flash("El enlace no es válido.", "error")
-        return redirect(url_for("dashboard"))
-
+    # Por ahora solo procesamos archivos subidos directamente.
+    # No descargamos videos de YouTube.
     flash(
-        "Enlace recibido. Para generar clips, sube un archivo "
-        "de vídeo que tengas autorización para procesar.",
+        "El procesamiento por enlace aún no está disponible. "
+        "Sube un archivo de video que tengas permiso para procesar.",
         "error"
     )
-
     return redirect(url_for("dashboard"))
 
-
-# =========================
-# REPROCESAR VÍDEO
-# =========================
 
 @app.post("/process/<int:video_id>")
 @login_required
@@ -238,10 +209,6 @@ def process_one(video_id):
     return redirect(url_for("dashboard"))
 
 
-# =========================
-# DESCARGAR CLIPS
-# =========================
-
 @app.get("/clips/<path:filename>")
 @login_required
 def get_clip(filename):
@@ -251,10 +218,6 @@ def get_clip(filename):
         as_attachment=True
     )
 
-
-# =========================
-# HERRAMIENTAS DE VÍDEO
-# =========================
 
 def run_cmd(args, timeout=3600):
     p = subprocess.run(
@@ -284,197 +247,228 @@ def video_duration(path):
     return float(out.strip())
 
 
-# =========================
-# INTELIGENCIA ARTIFICIAL
-# =========================
+def get_whisper_model():
+    global whisper_model
 
-def get_highlights(transcript, duration):
-    api_key = os.environ.get("OPENAI_API_KEY")
+    if whisper_model is None:
+        with model_lock:
+            if whisper_model is None:
+                from faster_whisper import WhisperModel
 
-    if not api_key:
-        raise RuntimeError("Falta OPENAI_API_KEY.")
+                model_name = os.environ.get(
+                    "WHISPER_MODEL", "tiny"
+                )
 
-    client = OpenAI(api_key=api_key)
+                whisper_model = WhisperModel(
+                    model_name,
+                    device="cpu",
+                    compute_type="int8"
+                )
 
-    prompt = f"""
-Analiza esta transcripción con marcas de tiempo.
+    return whisper_model
 
-Selecciona momentos interesantes, entretenidos, sorprendentes
-o que tengan sentido por sí solos para clips de redes sociales.
 
-Devuelve SOLO JSON:
-{{
-  "clips": [
-    {{
-      "start": 12.5,
-      "end": 48.0,
-      "title": "Título",
-      "reason": "Motivo"
-    }}
-  ]
-}}
+def transcribe_local(audio_path):
+    model = get_whisper_model()
 
-Reglas:
-- Los tiempos deben estar entre 0 y {duration:.1f}.
-- Cada clip debe durar entre 8 y 90 segundos.
-- No inventes contenido.
-- Evita clips repetidos o solapados.
-- Prioriza momentos que se entiendan sin mucho contexto.
-- No impongas un máximo diario de clips.
-
-TRANSCRIPCIÓN:
-{transcript[:90000]}
-"""
-
-    response = client.chat.completions.create(
-        model=os.environ.get("AI_TEXT_MODEL", "gpt-4o-mini"),
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": "Eres un editor profesional de videos. Responde JSON válido."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=0.3
+    segments, info = model.transcribe(
+        str(audio_path),
+        beam_size=1,
+        vad_filter=True
     )
 
-    data = json.loads(response.choices[0].message.content)
-    return data.get("clips", [])
+    result = []
+
+    for s in segments:
+        result.append({
+            "start": float(s.start),
+            "end": float(s.end),
+            "text": str(s.text).strip()
+        })
+
+    return result
 
 
-# =========================
-# PROCESAMIENTO DE VÍDEOS
-# =========================
+def find_highlights(segments, duration):
+    """
+    Detecta tramos con mayor actividad de voz.
+    No interpreta el significado del contenido.
+    """
+
+    if duration < 8 or not segments:
+        return []
+
+    window = 35
+    step = 12
+    candidates = []
+
+    start = 0.0
+
+    while start < duration:
+        end = min(duration, start + window)
+
+        if end - start < 8:
+            break
+
+        speech_time = 0.0
+        words = 0
+
+        for s in segments:
+            overlap_start = max(start, s["start"])
+            overlap_end = min(end, s["end"])
+
+            if overlap_end > overlap_start:
+                speech_time += overlap_end - overlap_start
+                words += len(s["text"].split())
+
+        length = end - start
+        density = speech_time / length
+        word_rate = words / length
+
+        # Puntaje de actividad de conversación.
+        score = (density * 0.7) + (min(word_rate / 3.0, 1.0) * 0.3)
+
+        if speech_time >= 5:
+            candidates.append({
+                "start": start,
+                "end": end,
+                "score": score,
+                "speech": speech_time
+            })
+
+        start += step
+
+    # Los tramos con más actividad se priorizan.
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    selected = []
+
+    for candidate in candidates:
+        # Evita clips demasiado solapados.
+        overlap = False
+
+        for chosen in selected:
+            if (
+                candidate["start"] < chosen["end"]
+                and candidate["end"] > chosen["start"]
+            ):
+                overlap = True
+                break
+
+        if overlap:
+            continue
+
+        selected.append(candidate)
+
+        if len(selected) >= 5:
+            break
+
+    selected.sort(key=lambda x: x["start"])
+
+    return selected
+
 
 def process_video_safe(video_id):
     with processing_lock:
-        try:
-            with app.app_context():
-                video = db.session.get(Video, video_id)
+        with app.app_context():
+            video = db.session.get(Video, video_id)
 
-                if not video or video.status == "done":
-                    return
+            if not video or video.status == "done":
+                return
 
-                video.status = "processing"
-                video.error = None
-                db.session.commit()
+            video.status = "processing"
+            video.error = None
+            db.session.commit()
 
-                source = UPLOAD_DIR / video.filename
-                audio = UPLOAD_DIR / f"{video_id}_audio.mp3"
+            source = UPLOAD_DIR / video.filename
+            audio = UPLOAD_DIR / f"{video_id}_audio.wav"
 
-                try:
-                    if not source.exists():
-                        raise RuntimeError("No se encontró el archivo de video.")
+            try:
+                if not source.exists():
+                    raise RuntimeError("No se encontró el archivo de video.")
 
-                    duration = video_duration(source)
+                duration = video_duration(source)
 
-                    # Extraer audio para transcripción.
+                # Extraer audio en formato liviano para transcribir.
+                run_cmd([
+                    "ffmpeg", "-y",
+                    "-i", str(source),
+                    "-vn",
+                    "-ac", "1",
+                    "-ar", "16000",
+                    str(audio)
+                ], timeout=3600)
+
+                # Transcripción local, sin API de pago.
+                segments = transcribe_local(audio)
+
+                moments = find_highlights(segments, duration)
+
+                made = 0
+
+                for i, m in enumerate(moments):
+                    start = max(0.0, float(m["start"]))
+                    end = min(duration, float(m["end"]))
+
+                    if end <= start or end - start < 8:
+                        continue
+
+                    outname = (
+                        f"clip_{video.id}_{uuid.uuid4().hex[:8]}.mp4"
+                    )
+
+                    outpath = CLIP_DIR / outname
+
                     run_cmd([
                         "ffmpeg", "-y",
+                        "-ss", str(start),
                         "-i", str(source),
-                        "-vn",
-                        "-ac", "1",
-                        "-ar", "16000",
-                        "-b:a", "64k",
-                        str(audio)
-                    ], timeout=3600)
+                        "-t", str(end - start),
+                        "-c:v", "libx264",
+                        "-preset", "veryfast",
+                        "-crf", "23",
+                        "-c:a", "aac",
+                        "-movflags", "+faststart",
+                        str(outpath)
+                    ], timeout=1800)
 
-                    client = OpenAI(
-                        api_key=os.environ["OPENAI_API_KEY"]
-                    )
-
-                    # Transcribir audio.
-                    with open(audio, "rb") as af:
-                        transcription = client.audio.transcriptions.create(
-                            model=os.environ.get(
-                                "AI_TRANSCRIBE_MODEL",
-                                "gpt-4o-mini-transcribe"
+                    db.session.add(
+                        Clip(
+                            video_id=video.id,
+                            filename=outname,
+                            title=f"Momento destacado {i+1}",
+                            reason=(
+                                "Tramo detectado por actividad de voz. "
+                                "El sistema gratuito no interpreta el significado."
                             ),
-                            file=af,
-                            response_format="verbose_json",
-                            timestamp_granularities=["segment"]
+                            start_seconds=start,
+                            end_seconds=end
                         )
-
-                    segments = getattr(transcription, "segments", None) or []
-
-                    transcript = "\n".join(
-                        f"[{float(s.start):.1f}-{float(s.end):.1f}] {s.text}"
-                        for s in segments
                     )
 
-                    if not transcript:
-                        transcript = getattr(transcription, "text", "")
-
-                    moments = get_highlights(transcript, duration)
-
-                    made = 0
-
-                    # Generar clips sin límite diario.
-                    for i, m in enumerate(moments):
-                        start = max(0.0, float(m.get("start", 0)))
-                        end = min(duration, float(m.get("end", 0)))
-
-                        if end <= start or end - start < 8:
-                            continue
-
-                        outname = (
-                            f"clip_{video.id}_{uuid.uuid4().hex[:8]}.mp4"
-                        )
-
-                        outpath = CLIP_DIR / outname
-
-                        run_cmd([
-                            "ffmpeg", "-y",
-                            "-ss", str(start),
-                            "-i", str(source),
-                            "-t", str(end - start),
-                            "-c:v", "libx264",
-                            "-preset", "veryfast",
-                            "-crf", "23",
-                            "-c:a", "aac",
-                            "-movflags", "+faststart",
-                            str(outpath)
-                        ], timeout=1800)
-
-                        db.session.add(
-                            Clip(
-                                video_id=video.id,
-                                filename=outname,
-                                title=str(
-                                    m.get("title", f"Momento destacado {i+1}")
-                                )[:180],
-                                reason=str(m.get("reason", ""))[:1000],
-                                start_seconds=start,
-                                end_seconds=end
-                            )
-                        )
-
-                        db.session.commit()
-                        made += 1
-
-                    video.status = "done"
                     db.session.commit()
+                    made += 1
 
-                except Exception as e:
+                if made == 0:
                     video.status = "error"
-                    video.error = str(e)[:3000]
-                    db.session.commit()
+                    video.error = (
+                        "No se detectaron suficientes tramos de voz "
+                        "para crear clips."
+                    )
+                else:
+                    video.status = "done"
 
-                finally:
-                    if audio.exists():
-                        audio.unlink(missing_ok=True)
+                db.session.commit()
 
-        except Exception as e:
-            app.logger.exception("Error procesando video %s", video_id)
+            except Exception as e:
+                video.status = "error"
+                video.error = str(e)[:3000]
+                db.session.commit()
 
+            finally:
+                if audio.exists():
+                    audio.unlink(missing_ok=True)
 
-# =========================
-# INICIALIZACIÓN
-# =========================
 
 init_db()
 
