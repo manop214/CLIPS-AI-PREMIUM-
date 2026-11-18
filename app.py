@@ -1,5 +1,7 @@
+
 import os
 import uuid
+import math
 import subprocess
 import threading
 from datetime import datetime
@@ -23,27 +25,36 @@ ROOT = Path(__file__).resolve().parent
 UPLOAD_DIR = ROOT / "uploads"
 CLIP_DIR = ROOT / "clips"
 
-UPLOAD_DIR.mkdir(exist_ok=True)
-CLIP_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+CLIP_DIR.mkdir(parents=True, exist_ok=True)
+
+SECRET_KEY = os.environ.get("SECRET_KEY")
+
+if not SECRET_KEY:
+    raise RuntimeError(
+        "Falta configurar la variable SECRET_KEY en el entorno."
+    )
 
 app = Flask(__name__)
 
 app.config.update(
-    SECRET_KEY=os.environ.get("SECRET_KEY", "CHANGE-ME"),
+    SECRET_KEY=SECRET_KEY,
     SQLALCHEMY_DATABASE_URI="sqlite:///" + str(ROOT / "clip_premium.db"),
     SQLALCHEMY_TRACK_MODIFICATIONS=False,
     MAX_CONTENT_LENGTH=2 * 1024 * 1024 * 1024,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "true").lower() == "true",
+    SESSION_COOKIE_SECURE=os.environ.get(
+        "COOKIE_SECURE", "true"
+    ).lower() == "true",
 )
 
 db = SQLAlchemy(app)
 csrf = CSRFProtect(app)
 
 ALLOWED = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
-processing_lock = threading.Lock()
 
+processing_lock = threading.Lock()
 whisper_model = None
 
 
@@ -64,7 +75,11 @@ class Video(db.Model):
 
 class Clip(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    video_id = db.Column(db.Integer, db.ForeignKey("video.id"), nullable=False)
+    video_id = db.Column(
+        db.Integer,
+        db.ForeignKey("video.id"),
+        nullable=False
+    )
     filename = db.Column(db.String(255), nullable=False)
     title = db.Column(db.String(180), nullable=False)
     reason = db.Column(db.Text)
@@ -79,7 +94,9 @@ def login_required(fn):
     def wrapper(*args, **kwargs):
         if "user_id" not in session:
             return redirect(url_for("login"))
+
         return fn(*args, **kwargs)
+
     return wrapper
 
 
@@ -90,13 +107,15 @@ def init_db():
         username = os.environ.get("ADMIN_USERNAME", "owner")
         password = os.environ.get("ADMIN_PASSWORD")
 
-        if password and not User.query.filter_by(username=username).first():
-            db.session.add(
-                User(
-                    username=username,
-                    password_hash=generate_password_hash(password)
-                )
+        if password and not User.query.filter_by(
+            username=username
+        ).first():
+            user = User(
+                username=username,
+                password_hash=generate_password_hash(password)
             )
+
+            db.session.add(user)
             db.session.commit()
 
 
@@ -108,10 +127,13 @@ def login():
 
         user = User.query.filter_by(username=username).first()
 
-        if user and check_password_hash(user.password_hash, password):
+        if user and check_password_hash(
+            user.password_hash, password
+        ):
             session.clear()
             session["user_id"] = user.id
             session.permanent = True
+
             return redirect(url_for("dashboard"))
 
         flash("Usuario o contraseña incorrectos.", "error")
@@ -129,8 +151,13 @@ def logout():
 @app.get("/")
 @login_required
 def dashboard():
-    videos = Video.query.order_by(Video.created_at.desc()).all()
-    clips = Clip.query.order_by(Clip.created_at.desc()).limit(100).all()
+    videos = Video.query.order_by(
+        Video.created_at.desc()
+    ).all()
+
+    clips = Clip.query.order_by(
+        Clip.created_at.desc()
+    ).limit(100).all()
 
     return render_template(
         "dashboard.html",
@@ -149,6 +176,11 @@ def upload():
         return redirect(url_for("dashboard"))
 
     original = secure_filename(f.filename)
+
+    if not original:
+        flash("El nombre del archivo no es válido.", "error")
+        return redirect(url_for("dashboard"))
+
     ext = Path(original).suffix.lower()
 
     if ext not in ALLOWED:
@@ -156,79 +188,123 @@ def upload():
         return redirect(url_for("dashboard"))
 
     stored = f"{uuid.uuid4().hex}{ext}"
-    f.save(UPLOAD_DIR / stored)
+    destination = UPLOAD_DIR / stored
 
-    video = Video(
-        filename=stored,
-        original_name=original,
-        status="queued"
-    )
+    try:
+        f.save(destination)
 
-    db.session.add(video)
-    db.session.commit()
+        if not destination.exists() or destination.stat().st_size == 0:
+            raise RuntimeError("El archivo subido está vacío.")
 
-    threading.Thread(
-        target=process_video_safe,
-        args=(video.id,),
-        daemon=True
-    ).start()
+        video = Video(
+            filename=stored,
+            original_name=original,
+            status="queued"
+        )
 
-    flash("Video añadido. El análisis comenzará automáticamente.", "success")
+        db.session.add(video)
+        db.session.commit()
+
+        threading.Thread(
+            target=process_video_safe,
+            args=(video.id,),
+            daemon=True
+        ).start()
+
+        flash(
+            "Video añadido. El análisis comenzará automáticamente.",
+            "success"
+        )
+
+    except Exception:
+        db.session.rollback()
+
+        if destination.exists():
+            destination.unlink(missing_ok=True)
+
+        app.logger.exception("Error al subir el video.")
+        flash("No se pudo subir el video.", "error")
+
     return redirect(url_for("dashboard"))
 
 
 @app.post("/process/<int:video_id>")
 @login_required
 def process_one(video_id):
+    video = db.session.get(Video, video_id)
+
+    if not video:
+        flash("No se encontró el video.", "error")
+        return redirect(url_for("dashboard"))
+
+    if video.status == "done":
+        flash("Este video ya fue procesado.", "error")
+        return redirect(url_for("dashboard"))
+
     threading.Thread(
         target=process_video_safe,
         args=(video_id,),
         daemon=True
     ).start()
 
-    flash("Análisis iniciado.", "success")
+    flash("Análisis solicitado.", "success")
     return redirect(url_for("dashboard"))
 
 
 @app.get("/clips/<path:filename>")
 @login_required
 def get_clip(filename):
-    return send_from_directory(CLIP_DIR, filename, as_attachment=True)
+    return send_from_directory(
+        CLIP_DIR,
+        filename,
+        as_attachment=True
+    )
 
 
 def run_cmd(args, timeout=3600):
-    p = subprocess.run(
+    process = subprocess.run(
         args,
         capture_output=True,
         text=True,
         timeout=timeout
     )
 
-    if p.returncode != 0:
-        raise RuntimeError((p.stderr or "Error de FFmpeg")[-1800:])
+    if process.returncode != 0:
+        error = process.stderr or "Error al ejecutar FFmpeg."
+        raise RuntimeError(error[-1800:])
 
-    return p.stdout
+    return process.stdout
 
 
 def video_duration(path):
-    out = run_cmd([
-        "ffprobe", "-v", "error",
+    output = run_cmd([
+        "ffprobe",
+        "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(path)
     ], timeout=120)
 
-    return float(out.strip())
+    duration = float(output.strip())
+
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError("La duración del video no es válida.")
+
+    return duration
 
 
 def get_whisper():
     global whisper_model
 
     if whisper_model is None:
+        model_name = os.environ.get("WHISPER_MODEL", "base")
+
         whisper_model = WhisperModel(
-            os.environ.get("WHISPER_MODEL", "base"),
+            model_name,
             device="cpu",
-            compute_type="int8"
+            compute_type="int8",
+            cpu_threads=2,
+            num_workers=1
         )
 
     return whisper_model
@@ -236,22 +312,20 @@ def get_whisper():
 
 def select_moments(segments, duration):
     """
-    Selección básica local, sin API de pago.
-    Detecta segmentos con contenido suficiente y agrupa
-    fragmentos cercanos para crear clips.
+    Selección local de fragmentos a partir de la transcripción.
+    No utiliza APIs externas ni servicios de pago.
     """
 
     moments = []
 
-    for s in segments:
-        start = float(s.start)
-        end = float(s.end)
-        text = (s.text or "").strip()
+    for segment in segments:
+        start = float(segment.start)
+        end = float(segment.end)
+        text = (segment.text or "").strip()
 
         if not text:
             continue
 
-        # Amplía un poco el contexto del segmento.
         start = max(0, start - 4)
         end = min(duration, end + 8)
 
@@ -268,25 +342,23 @@ def select_moments(segments, duration):
             "reason": "Fragmento detectado en la transcripción."
         })
 
-    # Quitar fragmentos demasiado próximos o solapados.
     selected = []
 
-    for m in moments:
-        if selected and m["start"] <= selected[-1]["end"]:
+    for moment in moments:
+        if selected and moment["start"] <= selected[-1]["end"]:
             selected[-1]["end"] = min(
                 duration,
-                max(selected[-1]["end"], m["end"])
+                max(selected[-1]["end"], moment["end"])
             )
             continue
 
-        selected.append(m)
+        selected.append(moment)
 
-    # Limitar la duración de los clips.
     final = []
 
-    for m in selected:
-        start = max(0, m["start"])
-        end = min(duration, m["end"])
+    for moment in selected:
+        start = max(0, moment["start"])
+        end = min(duration, moment["end"])
 
         if end - start > 90:
             end = start + 90
@@ -295,8 +367,8 @@ def select_moments(segments, duration):
             final.append({
                 "start": start,
                 "end": end,
-                "title": m["title"],
-                "reason": m["reason"]
+                "title": moment["title"],
+                "reason": moment["reason"]
             })
 
     return final
@@ -310,22 +382,25 @@ def process_video_safe(video_id):
             if not video or video.status == "done":
                 return
 
-            video.status = "processing"
-            video.error = None
-            db.session.commit()
-
             source = UPLOAD_DIR / video.filename
             audio = UPLOAD_DIR / f"{video_id}_audio.wav"
 
             try:
+                video.status = "processing"
+                video.error = None
+                db.session.commit()
+
                 if not source.exists():
-                    raise RuntimeError("No se encontró el archivo de video.")
+                    raise RuntimeError(
+                        "No se encontró el archivo de video."
+                    )
 
                 duration = video_duration(source)
 
-                # Audio optimizado para transcripción local.
                 run_cmd([
-                    "ffmpeg", "-y",
+                    "ffmpeg",
+                    "-y",
+                    "-nostdin",
                     "-i", str(source),
                     "-vn",
                     "-ac", "1",
@@ -337,27 +412,32 @@ def process_video_safe(video_id):
 
                 segments, info = model.transcribe(
                     str(audio),
-                    vad_filter=True
+                    vad_filter=True,
+                    beam_size=5
                 )
 
                 segments = list(segments)
 
                 moments = select_moments(segments, duration)
 
-                made = 0
-
-                for i, m in enumerate(moments):
-                    start = float(m["start"])
-                    end = float(m["end"])
+                for moment in moments:
+                    start = float(moment["start"])
+                    end = float(moment["end"])
 
                     if end <= start or end - start < 8:
                         continue
 
-                    outname = f"clip_{video.id}_{uuid.uuid4().hex[:8]}.mp4"
+                    outname = (
+                        f"clip_{video.id}_"
+                        f"{uuid.uuid4().hex[:8]}.mp4"
+                    )
+
                     outpath = CLIP_DIR / outname
 
                     run_cmd([
-                        "ffmpeg", "-y",
+                        "ffmpeg",
+                        "-y",
+                        "-nostdin",
                         "-ss", str(start),
                         "-i", str(source),
                         "-t", str(end - start),
@@ -369,27 +449,35 @@ def process_video_safe(video_id):
                         str(outpath)
                     ], timeout=1800)
 
-                    db.session.add(
-                        Clip(
-                            video_id=video.id,
-                            filename=outname,
-                            title=m["title"][:180],
-                            reason=m["reason"][:1000],
-                            start_seconds=start,
-                            end_seconds=end
-                        )
+                    clip = Clip(
+                        video_id=video.id,
+                        filename=outname,
+                        title=moment["title"][:180],
+                        reason=moment["reason"][:1000],
+                        start_seconds=start,
+                        end_seconds=end
                     )
 
+                    db.session.add(clip)
                     db.session.commit()
-                    made += 1
 
                 video.status = "done"
                 db.session.commit()
 
-            except Exception as e:
-                video.status = "error"
-                video.error = str(e)[:3000]
-                db.session.commit()
+            except Exception as error:
+                db.session.rollback()
+
+                video = db.session.get(Video, video_id)
+
+                if video:
+                    video.status = "error"
+                    video.error = str(error)[:3000]
+                    db.session.commit()
+
+                app.logger.exception(
+                    "Error procesando el video %s",
+                    video_id
+                )
 
             finally:
                 if audio.exists():
@@ -405,3 +493,4 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5000)),
         debug=False
     )
+    
