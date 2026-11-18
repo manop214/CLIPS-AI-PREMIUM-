@@ -1,4 +1,3 @@
-
 import os
 import json
 import uuid
@@ -45,9 +44,13 @@ csrf = CSRFProtect(app)
 
 ALLOWED = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 
-# Evita que varios videos consuman recursos simultáneamente.
+# Evita varios procesamientos simultáneos.
 processing_lock = threading.Lock()
 
+
+# =========================
+# MODELOS DE BASE DE DATOS
+# =========================
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -73,8 +76,13 @@ class Clip(db.Model):
     start_seconds = db.Column(db.Float, nullable=False)
     end_seconds = db.Column(db.Float, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
     video = db.relationship("Video", backref="clips")
 
+
+# =========================
+# AUTENTICACIÓN
+# =========================
 
 def login_required(fn):
     @wraps(fn)
@@ -128,19 +136,26 @@ def logout():
     return redirect(url_for("login"))
 
 
+# =========================
+# PANEL PRINCIPAL
+# =========================
+
 @app.get("/")
 @login_required
 def dashboard():
     videos = Video.query.order_by(Video.created_at.desc()).all()
     clips = Clip.query.order_by(Clip.created_at.desc()).limit(100).all()
 
-    # Ya no se calcula ni se muestra límite diario.
     return render_template(
         "dashboard.html",
         videos=videos,
         clips=clips
     )
 
+
+# =========================
+# SUBIR VÍDEO
+# =========================
 
 @app.post("/upload")
 @login_required
@@ -180,6 +195,36 @@ def upload():
     return redirect(url_for("dashboard"))
 
 
+# =========================
+# RECIBIR ENLACE
+# =========================
+
+@app.post("/add-video-link")
+@login_required
+def add_video_link():
+    video_url = request.form.get("video_url", "").strip()
+
+    if not video_url:
+        flash("Pega un enlace de vídeo válido.", "error")
+        return redirect(url_for("dashboard"))
+
+    if not video_url.startswith(("https://", "http://")):
+        flash("El enlace no es válido.", "error")
+        return redirect(url_for("dashboard"))
+
+    flash(
+        "Enlace recibido. Para generar clips, sube un archivo "
+        "de vídeo que tengas autorización para procesar.",
+        "error"
+    )
+
+    return redirect(url_for("dashboard"))
+
+
+# =========================
+# REPROCESAR VÍDEO
+# =========================
+
 @app.post("/process/<int:video_id>")
 @login_required
 def process_one(video_id):
@@ -193,6 +238,10 @@ def process_one(video_id):
     return redirect(url_for("dashboard"))
 
 
+# =========================
+# DESCARGAR CLIPS
+# =========================
+
 @app.get("/clips/<path:filename>")
 @login_required
 def get_clip(filename):
@@ -202,6 +251,10 @@ def get_clip(filename):
         as_attachment=True
     )
 
+
+# =========================
+# HERRAMIENTAS DE VÍDEO
+# =========================
 
 def run_cmd(args, timeout=3600):
     p = subprocess.run(
@@ -230,6 +283,10 @@ def video_duration(path):
 
     return float(out.strip())
 
+
+# =========================
+# INTELIGENCIA ARTIFICIAL
+# =========================
 
 def get_highlights(transcript, duration):
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -289,8 +346,11 @@ TRANSCRIPCIÓN:
     return data.get("clips", [])
 
 
+# =========================
+# PROCESAMIENTO DE VÍDEOS
+# =========================
+
 def process_video_safe(video_id):
-    # Espera su turno en lugar de descartar el procesamiento.
     with processing_lock:
         try:
             with app.app_context():
@@ -327,6 +387,7 @@ def process_video_safe(video_id):
                         api_key=os.environ["OPENAI_API_KEY"]
                     )
 
+                    # Transcribir audio.
                     with open(audio, "rb") as af:
                         transcription = client.audio.transcriptions.create(
                             model=os.environ.get(
@@ -352,7 +413,7 @@ def process_video_safe(video_id):
 
                     made = 0
 
-                    # Sin límite diario de clips.
+                    # Generar clips sin límite diario.
                     for i, m in enumerate(moments):
                         start = max(0.0, float(m.get("start", 0)))
                         end = min(duration, float(m.get("end", 0)))
@@ -411,7 +472,10 @@ def process_video_safe(video_id):
             app.logger.exception("Error procesando video %s", video_id)
 
 
-# Inicializa la base de datos al importar la aplicación.
+# =========================
+# INICIALIZACIÓN
+# =========================
+
 init_db()
 
 
