@@ -236,8 +236,7 @@ def process_video_safe(video_id):
 
 def daily_job():
     with app.app_context():
-        remaining = max(0, 10 - Clip.query.filter(
-            db.func.date(Clip.created_at) == date.today().isoformat()).count())
+    
         if remaining <= 0:
             return
         queued = Video.query.filter_by(status="queued").order_by(Video.created_at.asc()).all()
