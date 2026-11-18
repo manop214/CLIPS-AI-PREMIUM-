@@ -1,4 +1,3 @@
-
 import os
 import uuid
 import subprocess
@@ -8,14 +7,15 @@ from pathlib import Path
 from functools import wraps
 
 from flask import (
-    Flask, render_template, request, redirect, url_for,
-    session, flash, send_from_directory
+    Flask, render_template, request, redirect,
+    url_for, session, flash, send_from_directory
 )
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
+from faster_whisper import WhisperModel
 
 load_dotenv()
 
@@ -35,19 +35,16 @@ app.config.update(
     MAX_CONTENT_LENGTH=2 * 1024 * 1024 * 1024,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get(
-        "COOKIE_SECURE", "true"
-    ).lower() == "true",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "true").lower() == "true",
 )
 
 db = SQLAlchemy(app)
 csrf = CSRFProtect(app)
 
 ALLOWED = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
-
 processing_lock = threading.Lock()
+
 whisper_model = None
-model_lock = threading.Lock()
 
 
 class User(db.Model):
@@ -67,16 +64,13 @@ class Video(db.Model):
 
 class Clip(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    video_id = db.Column(
-        db.Integer, db.ForeignKey("video.id"), nullable=False
-    )
+    video_id = db.Column(db.Integer, db.ForeignKey("video.id"), nullable=False)
     filename = db.Column(db.String(255), nullable=False)
     title = db.Column(db.String(180), nullable=False)
     reason = db.Column(db.Text)
     start_seconds = db.Column(db.Float, nullable=False)
     end_seconds = db.Column(db.Float, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
     video = db.relationship("Video", backref="clips")
 
 
@@ -183,19 +177,6 @@ def upload():
     return redirect(url_for("dashboard"))
 
 
-@app.post("/add-video-link")
-@login_required
-def add_video_link():
-    # Por ahora solo procesamos archivos subidos directamente.
-    # No descargamos videos de YouTube.
-    flash(
-        "El procesamiento por enlace aún no está disponible. "
-        "Sube un archivo de video que tengas permiso para procesar.",
-        "error"
-    )
-    return redirect(url_for("dashboard"))
-
-
 @app.post("/process/<int:video_id>")
 @login_required
 def process_one(video_id):
@@ -212,11 +193,7 @@ def process_one(video_id):
 @app.get("/clips/<path:filename>")
 @login_required
 def get_clip(filename):
-    return send_from_directory(
-        CLIP_DIR,
-        filename,
-        as_attachment=True
-    )
+    return send_from_directory(CLIP_DIR, filename, as_attachment=True)
 
 
 def run_cmd(args, timeout=3600):
@@ -228,17 +205,14 @@ def run_cmd(args, timeout=3600):
     )
 
     if p.returncode != 0:
-        raise RuntimeError(
-            (p.stderr or "Error de FFmpeg")[-1800:]
-        )
+        raise RuntimeError((p.stderr or "Error de FFmpeg")[-1800:])
 
     return p.stdout
 
 
 def video_duration(path):
     out = run_cmd([
-        "ffprobe",
-        "-v", "error",
+        "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(path)
@@ -247,125 +221,85 @@ def video_duration(path):
     return float(out.strip())
 
 
-def get_whisper_model():
+def get_whisper():
     global whisper_model
 
     if whisper_model is None:
-        with model_lock:
-            if whisper_model is None:
-                from faster_whisper import WhisperModel
-
-                model_name = os.environ.get(
-                    "WHISPER_MODEL", "tiny"
-                )
-
-                whisper_model = WhisperModel(
-                    model_name,
-                    device="cpu",
-                    compute_type="int8"
-                )
+        whisper_model = WhisperModel(
+            os.environ.get("WHISPER_MODEL", "base"),
+            device="cpu",
+            compute_type="int8"
+        )
 
     return whisper_model
 
 
-def transcribe_local(audio_path):
-    model = get_whisper_model()
+def select_moments(segments, duration):
+    """
+    Selección básica local, sin API de pago.
+    Detecta segmentos con contenido suficiente y agrupa
+    fragmentos cercanos para crear clips.
+    """
 
-    segments, info = model.transcribe(
-        str(audio_path),
-        beam_size=1,
-        vad_filter=True
-    )
-
-    result = []
+    moments = []
 
     for s in segments:
-        result.append({
-            "start": float(s.start),
-            "end": float(s.end),
-            "text": str(s.text).strip()
-        })
+        start = float(s.start)
+        end = float(s.end)
+        text = (s.text or "").strip()
 
-    return result
-
-
-def find_highlights(segments, duration):
-    """
-    Detecta tramos con mayor actividad de voz.
-    No interpreta el significado del contenido.
-    """
-
-    if duration < 8 or not segments:
-        return []
-
-    window = 35
-    step = 12
-    candidates = []
-
-    start = 0.0
-
-    while start < duration:
-        end = min(duration, start + window)
-
-        if end - start < 8:
-            break
-
-        speech_time = 0.0
-        words = 0
-
-        for s in segments:
-            overlap_start = max(start, s["start"])
-            overlap_end = min(end, s["end"])
-
-            if overlap_end > overlap_start:
-                speech_time += overlap_end - overlap_start
-                words += len(s["text"].split())
-
-        length = end - start
-        density = speech_time / length
-        word_rate = words / length
-
-        # Puntaje de actividad de conversación.
-        score = (density * 0.7) + (min(word_rate / 3.0, 1.0) * 0.3)
-
-        if speech_time >= 5:
-            candidates.append({
-                "start": start,
-                "end": end,
-                "score": score,
-                "speech": speech_time
-            })
-
-        start += step
-
-    # Los tramos con más actividad se priorizan.
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-
-    selected = []
-
-    for candidate in candidates:
-        # Evita clips demasiado solapados.
-        overlap = False
-
-        for chosen in selected:
-            if (
-                candidate["start"] < chosen["end"]
-                and candidate["end"] > chosen["start"]
-            ):
-                overlap = True
-                break
-
-        if overlap:
+        if not text:
             continue
 
-        selected.append(candidate)
+        # Amplía un poco el contexto del segmento.
+        start = max(0, start - 4)
+        end = min(duration, end + 8)
 
-        if len(selected) >= 5:
-            break
+        if end - start < 8:
+            end = min(duration, start + 8)
 
-    selected.sort(key=lambda x: x["start"])
+        if end <= start:
+            continue
 
-    return selected
+        moments.append({
+            "start": start,
+            "end": end,
+            "title": text[:80] or "Momento destacado",
+            "reason": "Fragmento detectado en la transcripción."
+        })
+
+    # Quitar fragmentos demasiado próximos o solapados.
+    selected = []
+
+    for m in moments:
+        if selected and m["start"] <= selected[-1]["end"]:
+            selected[-1]["end"] = min(
+                duration,
+                max(selected[-1]["end"], m["end"])
+            )
+            continue
+
+        selected.append(m)
+
+    # Limitar la duración de los clips.
+    final = []
+
+    for m in selected:
+        start = max(0, m["start"])
+        end = min(duration, m["end"])
+
+        if end - start > 90:
+            end = start + 90
+
+        if end - start >= 8:
+            final.append({
+                "start": start,
+                "end": end,
+                "title": m["title"],
+                "reason": m["reason"]
+            })
+
+    return final
 
 
 def process_video_safe(video_id):
@@ -389,7 +323,7 @@ def process_video_safe(video_id):
 
                 duration = video_duration(source)
 
-                # Extraer audio en formato liviano para transcribir.
+                # Audio optimizado para transcripción local.
                 run_cmd([
                     "ffmpeg", "-y",
                     "-i", str(source),
@@ -399,24 +333,27 @@ def process_video_safe(video_id):
                     str(audio)
                 ], timeout=3600)
 
-                # Transcripción local, sin API de pago.
-                segments = transcribe_local(audio)
+                model = get_whisper()
 
-                moments = find_highlights(segments, duration)
+                segments, info = model.transcribe(
+                    str(audio),
+                    vad_filter=True
+                )
+
+                segments = list(segments)
+
+                moments = select_moments(segments, duration)
 
                 made = 0
 
                 for i, m in enumerate(moments):
-                    start = max(0.0, float(m["start"]))
-                    end = min(duration, float(m["end"]))
+                    start = float(m["start"])
+                    end = float(m["end"])
 
                     if end <= start or end - start < 8:
                         continue
 
-                    outname = (
-                        f"clip_{video.id}_{uuid.uuid4().hex[:8]}.mp4"
-                    )
-
+                    outname = f"clip_{video.id}_{uuid.uuid4().hex[:8]}.mp4"
                     outpath = CLIP_DIR / outname
 
                     run_cmd([
@@ -436,11 +373,8 @@ def process_video_safe(video_id):
                         Clip(
                             video_id=video.id,
                             filename=outname,
-                            title=f"Momento destacado {i+1}",
-                            reason=(
-                                "Tramo detectado por actividad de voz. "
-                                "El sistema gratuito no interpreta el significado."
-                            ),
+                            title=m["title"][:180],
+                            reason=m["reason"][:1000],
                             start_seconds=start,
                             end_seconds=end
                         )
@@ -449,15 +383,7 @@ def process_video_safe(video_id):
                     db.session.commit()
                     made += 1
 
-                if made == 0:
-                    video.status = "error"
-                    video.error = (
-                        "No se detectaron suficientes tramos de voz "
-                        "para crear clips."
-                    )
-                else:
-                    video.status = "done"
-
+                video.status = "done"
                 db.session.commit()
 
             except Exception as e:
@@ -479,4 +405,3 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 5000)),
         debug=False
     )
-    
