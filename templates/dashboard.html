@@ -1,4 +1,3 @@
-
 {% extends "base.html" %}
 {% block content %}
 
@@ -11,7 +10,30 @@
 </div>
 
 <section class="card">
-    <h2>＋ Añadir vídeo</h2>
+    <h2>🔗 Pegar enlace de vídeo</h2>
+    <p class="muted">
+        Pega un enlace de YouTube o de un stream compatible
+        que tengas autorización para procesar.
+    </p>
+
+    <form method="post" action="/add-video-link">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <input
+            type="url"
+            name="video_url"
+            placeholder="https://youtube.com/watch?v=..."
+            required
+        >
+
+        <button class="primary" type="submit">
+            GENERAR CLIPS
+        </button>
+    </form>
+</section>
+
+<section class="card">
+    <h2>＋ Subir vídeo</h2>
     <p class="muted">
         Sube un vídeo propio o uno que tengas permiso para procesar.
         Formatos compatibles: MP4, MOV, MKV y WEBM.
@@ -70,7 +92,7 @@
         </div>
     {% else %}
         <p class="muted">
-            Todavía no has subido vídeos.
+            Todavía no has agregado vídeos.
             Tus vídeos aparecerán aquí cuando los agregues.
         </p>
     {% endif %}
@@ -115,9 +137,9 @@
 </section>
 
 <div class="hint">
-    Sube tus vídeos para que CLIP PREMIUM pueda analizarlos y encontrar
-    momentos destacados. El procesamiento puede tardar dependiendo de la
-    duración del vídeo.
+    Añade un vídeo o un enlace compatible para que CLIP PREMIUM
+    pueda analizarlo y encontrar momentos destacados. El procesamiento
+    puede tardar dependiendo de la duración del vídeo.
 </div>
 
 {% endblock %}
